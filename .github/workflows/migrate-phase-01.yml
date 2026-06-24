@@ -16,8 +16,8 @@ name: Migrate Phase 01 — DB schema (source / correlation_id / entra_oid)
 # Pré-requisitos no fork (ver runbook docs/runbooks/aula1-f1-portal-guide-ambiente-hml-cin.md):
 #   - secret AZURE_CREDENTIALS      : Service Principal p/ az login (seção "Service Principal")
 #   - secret SQL_CONNECTION_STRING  : connection string do FIFA2026Tickets (User Id/Password)
-#   - var    PHASE01_SQL_SERVER     : nome do SQL server (sem sufixo) — default sql-dev-tk-cin-001
-#   - var    PHASE01_RESOURCE_GROUP : RG do SQL — default rg-hml-tik-cin-001
+#   - var    SQL_SERVER     : nome do SQL server (sem sufixo) — default sql-dev-tk-cin-001
+#   - var    RESOURCE_GROUP : RG do SQL — default rg-hml-tik-cin-001
 
 on:
   workflow_dispatch:
@@ -50,8 +50,8 @@ jobs:
         run: |
           set -euo pipefail
           # Precedência: input manual -> GitHub Variable (aluno) -> default.
-          SQL_SERVER="${{ github.event.inputs.sql_server || vars.PHASE01_SQL_SERVER || env.DEFAULT_SQL_SERVER }}"
-          RG="${{ github.event.inputs.resource_group || vars.PHASE01_RESOURCE_GROUP || env.DEFAULT_RESOURCE_GROUP }}"
+          SQL_SERVER="${{ github.event.inputs.sql_server || vars.SQL_SERVER || env.DEFAULT_SQL_SERVER }}"
+          RG="${{ github.event.inputs.resource_group || vars.RESOURCE_GROUP || env.DEFAULT_RESOURCE_GROUP }}"
           RUNNER_IP="$(curl -fsS https://api.ipify.org)"
           RULE_NAME="gh-migrate-${{ github.run_id }}"
           {

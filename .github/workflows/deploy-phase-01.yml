@@ -1,18 +1,13 @@
 name: Deploy Phase 01 — Service Bus + Functions
 
 # Empacota e publica as Azure Functions .NET 8 (isolated worker) da Fase 1
-# (EPIC-002 / Story 2.1). Dispara no push da branch da fase ou manualmente.
+# (EPIC-002 / Story 2.1). Disparo MANUAL apenas (Actions → Run workflow).
 #
 # Pré-requisitos (configurados pelo @devops / por aluno):
-#   - secret  PHASE01_FUNCTION_PUBLISH_PROFILE : publish profile da Function App
-#   - var     PHASE01_FUNCTION_APP_NAME        : nome da Function App de destino
+#   - secret  FUNCTION_PUBLISH_PROFILE : publish profile da Function App
+#   - var     FUNCTION_APP_NAME        : nome da Function App de destino
 
 on:
-  push:
-    branches: [phase-01-servicebus-functions]
-    paths:
-      - 'src/Fifa2026.V2.Functions/**'
-      - '.github/workflows/deploy-phase-01.yml'
   workflow_dispatch:
     inputs:
       app_name:
@@ -58,13 +53,13 @@ jobs:
         uses: Azure/functions-action@v1
         with:
           # Precedência: input manual → GitHub Variable (aluno).
-          app-name: ${{ github.event.inputs.app_name || vars.PHASE01_FUNCTION_APP_NAME }}
+          app-name: ${{ github.event.inputs.app_name || vars.FUNCTION_APP_NAME }}
           package: ./publish
-          publish-profile: ${{ secrets.PHASE01_FUNCTION_PUBLISH_PROFILE }}
+          publish-profile: ${{ secrets.FUNCTION_PUBLISH_PROFILE }}
 
       - name: Smoke test (AC-10)
         env:
-          APP_NAME: ${{ github.event.inputs.app_name || vars.PHASE01_FUNCTION_APP_NAME }}
+          APP_NAME: ${{ github.event.inputs.app_name || vars.FUNCTION_APP_NAME }}
         run: |
           set -euo pipefail
           echo "Aguardando warmup da Function App (cold start)..."

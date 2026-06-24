@@ -1,136 +1,279 @@
-# Guia de Portal — Aula 1 (F1: Service Bus + Functions) no ambiente HML do Raphael
+# Guia do Aluno — Aula 1 (F1: Service Bus + Functions) do zero
 
-> **Objetivo:** montar a F1 (fila + funções) **no ambiente que já existe** (`rg-hml-tik-cin-001`, Central India, subscription `SUBS - HML`), aproveitando o banco, a VNet e o plano B1 do Raphael.
+> **O que você vai construir nesta aula:** a **Fase 1 (F1)** do projeto FIFA 2026 Tickets — uma fila de mensagens (**Azure Service Bus**) e uma **Azure Function** que consome essa fila e grava as compras no banco. Tudo isso **no SEU próprio ambiente Azure**, criado do zero.
 >
-> **Divisão de trabalho:**
-> - **Azure (recursos + parametrização)** → você monta **na mão no portal**, seguindo este guia.
-> - **Código** → deploy via **GitHub Actions** (`deploy-phase-01.yml`), **um único deploy** ao final.
->
-> **Pré-condições já validadas (2026-06-22):** banco `FIFA2026Tickets` online (privado); VNet `vnet-prd-inf-cin-001` (10.1.0.0/16) com subnet `snet-prd-inf-appsvc-cin-001` (já integrada aos apps); DNS privado do SQL configurado; providers ServiceBus/Insights/OperationalInsights ativados; plano `asp-prd-tk-cin-001` (B1) hospeda backend+frontend dentro da VNet.
+> **Importante (leia antes de começar):**
+> - **Cada aluno cria TUDO no próprio Azure**: seu tenant, sua subscription, seu Resource Group, seus recursos, com **seus próprios nomes**. Não há reaproveitamento de ambiente de ninguém.
+> - O **App Registration / Service Principal** é criado **no SEU tenant**. O **admin do SQL** é você.
+> - Você vai fazer **fork do repositório do evento** (organização **TFTEC**) para a **sua conta** do GitHub. Tudo (Variables, Secrets, Actions) acontece **no SEU fork**. Você nunca dá push no repositório da TFTEC.
 
 ---
 
-## Convenção de nomes (padrão CAF do ambiente)
+## Parte 0 — Fork + visão geral
 
-| Recurso | Nome | Observação |
+### 0.1 Faça o fork do repositório
+
+1. Acesse o repositório do evento na organização **TFTEC** (link fornecido pelo instrutor).
+2. Clique em **`Fork`** (canto superior direito) → selecione **a sua conta** como destino → **`Create fork`**.
+3. Pronto: agora existe uma cópia em `https://github.com/<seu-usuario>/<repo>`. **Todo o trabalho desta aula é nesse fork.**
+
+> Você **não precisa** clonar localmente para esta aula — o deploy de código e as migrations rodam pelo **GitHub Actions** do seu fork. Clonar é opcional (só se quiser ler o código).
+
+### 0.2 Como as peças se encaixam
+
+Há **duas divisões de trabalho** bem distintas:
+
+| O quê | Como é feito | Onde |
 |---|---|---|
-| Resource Group | `rg-hml-tik-cin-001` | **já existe** — use este |
-| Service Bus namespace | `sb-dev-tk-cin-001` | único global; se ocupado, use `-002` |
-| Fila | `tickets-purchase` | fixo (o código espera este nome) |
-| Storage Account | `stdevtkcin001` | minúsculo, sem hífen, ≤24 chars; se ocupado, ajuste dígitos |
-| Log Analytics | `log-dev-tk-cin-001` | base do App Insights |
-| Application Insights | `appi-dev-tk-cin-001` | — |
-| Function App | `func-dev-tk-cin-001` | rodará no plano B1 existente |
+| **AMBIENTE** (RG, SQL, Service Bus, Function App, etc.) | **À mão, no Portal do Azure** | Portal (este guia) |
+| **CÓDIGO + MIGRATIONS** | **GitHub Actions** (workflows prontos) | Seu fork |
 
-> **Região de tudo: Central India** (mesma do RG, evita latência ao banco).
+```
+                      VOCÊ (Portal Azure)                    SEU FORK (GitHub Actions)
+                      ───────────────────                    ─────────────────────────
+  ┌─────────────────────────────────────────────┐
+  │  RG → SQL+DB → Service Bus+fila → Storage →   │
+  │  Log Analytics → App Insights → Function App  │ ──┐
+  │  + App Settings + SCM basic-auth              │   │  (1) você cria o ambiente vazio
+  └─────────────────────────────────────────────┘   │
+                                                      ▼
+                              ┌───────────────────────────────────────────┐
+                              │  migrate-phase-01.yml  → aplica colunas no  │
+                              │                          banco (idempotente)│
+                              │  deploy-phase-01.yml   → publica a Function │
+                              │                          + smoke test       │
+                              └───────────────────────────────────────────┘
+                                                      │
+                                                      ▼
+   Fluxo em runtime:  POST /api/v2/purchase → 202 + correlationId
+                      → mensagem na fila tickets-purchase
+                      → Function consome → grava em purchases (source='v2')
+                      → compra inválida → DLQ
+```
 
----
-
-## Fase 1 — Service Bus (a fila)
-
-### 1.1 Criar o Namespace
-1. Portal → busca **"Service Bus"** → **`+ Create`**.
-2. **Subscription:** `SUBS - HML` · **Resource group:** `rg-hml-tik-cin-001`
-3. **Namespace name:** `sb-dev-tk-cin-001`
-4. **Location:** **Central India**
-5. **Pricing tier:** **Standard** ⚠️ (não Basic)
-6. **`Review + create`** → **`Create`** → **`Go to resource`**.
-
-### 1.2 Criar a fila
-1. No namespace → **Entities → Queues** → **`+ Queue`**.
-2. **Name:** `tickets-purchase`
-3. **Max delivery count:** `10` · **Lock duration:** `30` segundos
-4. **`Create`**. (A DLQ é criada automaticamente.)
-
-✅ **Checkpoint:** fila `tickets-purchase` listada. *(A connection string a gente pega depois — Fase 4.)*
+A regra de ouro: **o Portal cria os recursos vazios; os Actions só publicam código e schema.**
 
 ---
 
-## Fase 2 — Storage + Application Insights
+## Convenção de nomes (preencha a SUA)
 
-### 2.1 Storage Account (apoio da Function)
-1. Portal → **"Storage accounts"** → **`+ Create`**.
-2. **RG:** `rg-hml-tik-cin-001` · **Name:** `stdevtkcin001` · **Region:** **Central India**
-3. **Performance:** Standard · **Redundancy:** **LRS** (mais barato, suficiente)
+Os nomes abaixo são **seus** — escolha um prefixo pessoal (ex.: suas iniciais + `f1`) e preencha a coluna **"Seu valor"**. Anote, porque você vai reusar esses nomes o tempo todo (Portal, App Settings, Variables do GitHub).
+
+| Recurso | Placeholder | Seu valor | Regras / observação |
+|---|---|---|---|
+| Subscription | `<sua-subscription>` | ________ | a sua subscription do Azure |
+| Tenant ID | `<seu-tenant-id>` | ________ | Portal → **Microsoft Entra ID** → Overview → *Tenant ID* |
+| Resource Group | `<seu-rg>` | ________ | você cria nesta aula |
+| Região | `<sua-regiao>` | ________ | use **a mesma região para tudo** (evita latência) |
+| SQL Server (logical) | `<seu-sql-server>` | ________ | único global; minúsculo; ex.: `sql-<prefixo>-001` |
+| Database | `FIFA2026Tickets` | **FIFA2026Tickets** | **FIXO** — o código espera este nome |
+| Service Bus namespace | `<seu-sb>` | ________ | único global; ex.: `sb-<prefixo>-001` |
+| Fila | `tickets-purchase` | **tickets-purchase** | **FIXO** — o código espera este nome |
+| Storage Account | `<seu-storage>` | ________ | **minúsculo, sem hífen, ≤24 chars**, único global |
+| Log Analytics | `<seu-log>` | ________ | base do App Insights |
+| Application Insights | `<seu-appi>` | ________ | telemetria da Function |
+| Function App | `<seu-func>` | ________ | único global; ex.: `func-<prefixo>-001` |
+| App Service plan | `<seu-plano>` | ________ | você cria nesta aula (B1, Windows) |
+
+> 💡 **Dica:** nomes "globais únicos" (SQL Server, Service Bus, Storage, Function App) podem dar erro de "já existe". Se acontecer, adicione dígitos/iniciais (ex.: `-002`, `gpc`).
+>
+> 📋 No final do guia tem um **Apêndice com um exemplo real preenchido** (ambiente de referência validado) — use como modelo de como nomear.
+
+---
+
+## Fase 1 — Resource Group
+
+1. Portal → busque **"Resource groups"** → **`+ Create`**.
+2. **Subscription:** `<sua-subscription>` · **Resource group:** `<seu-rg>` · **Region:** `<sua-regiao>`.
+3. **`Review + create`** → **`Create`**.
+
+✅ **Checkpoint:** seu RG aparece na lista. Daqui pra frente, **tudo** é criado dentro dele e na mesma região.
+
+---
+
+## Fase 2 — SQL Server + Database (FIFA2026Tickets)
+
+A Function grava as compras numa tabela `purchases`. Você precisa do banco antes de tudo.
+
+### 2.1 Criar o SQL Server (logical server)
+
+1. Portal → **"SQL servers"** → **`+ Create`**.
+2. **RG:** `<seu-rg>` · **Server name:** `<seu-sql-server>` · **Location:** `<sua-regiao>`.
+3. **Authentication method:** **Use SQL authentication** (mais simples para o workshop).
+   - **Server admin login:** ex.: `adminsql` · **Password:** escolha uma senha forte e **guarde** (vai virar segredo, nunca commit).
 4. **`Review + create`** → **`Create`**.
 
-### 2.2 Log Analytics Workspace
-1. Portal → **"Log Analytics workspaces"** → **`+ Create`**.
-2. **RG:** `rg-hml-tik-cin-001` · **Name:** `log-dev-tk-cin-001` · **Region:** **Central India** → **`Create`**.
+### 2.2 Criar o Database
 
-### 2.3 Application Insights
-1. Portal → **"Application Insights"** → **`+ Create`**.
-2. **RG:** `rg-hml-tik-cin-001` · **Name:** `appi-dev-tk-cin-001` · **Region:** **Central India**
-3. **Workspace:** selecione `log-dev-tk-cin-001` (criado acima) → **`Create`**.
+1. No servidor criado → **`+ Create database`** (ou Portal → **"SQL databases"** → **`+ Create`**).
+2. **Database name:** **`FIFA2026Tickets`** (FIXO).
+3. **Server:** `<seu-sql-server>` · **Compute + storage:** **Basic** ou **Serverless** (suficiente para o workshop e mais barato).
+4. **`Review + create`** → **`Create`**.
 
-✅ **Checkpoint:** Storage + Log Analytics + App Insights criados no RG.
+### 2.3 Decisão de rede do SQL — escolha UM caminho
+
+> ⚠️ **Decisão para o owner / instrutor:** o caminho **recomendado para alunos** é o **Público com firewall (Opção B)** — é muito mais simples e o workshop roda igual. O **Privado (Opção A)** é fiel à arquitetura de produção, mas exige VNet/Private Endpoint/DNS e mais tempo. Se a aula priorizar simplicidade, vá de **Opção B**.
+
+#### Opção A — SQL **privado** (fiel à arquitetura de produção)
+
+Deixa o banco sem acesso público; a Function alcança via VNet.
+
+1. **VNet:** Portal → **"Virtual networks"** → **`+ Create`** → `<seu-rg>`, `<sua-regiao>`, espaço ex.: `10.1.0.0/16`.
+2. **Subnets:** crie uma subnet para o **Private Endpoint do SQL** (ex.: `snet-sql`, `10.1.1.0/24`) e uma para a **integração da Function** (ex.: `snet-appsvc`, `10.1.2.0/24`, delegada a `Microsoft.Web/serverFarms`).
+3. **Private Endpoint:** no SQL server → **Networking → Private access → `+ Create a private endpoint`** → coloque na `snet-sql` → habilite **Private DNS integration** (cria a zona `privatelink.database.windows.net`).
+4. Em **Networking → Public access** do SQL: **Disable** (`Public network access = Disabled`).
+
+> O workflow de migrations (`migrate-phase-01.yml`) **já sabe lidar com SQL privado**: ele liga o acesso público temporariamente só para o IP do runner, roda as migrations e **reverte tudo** ao final (inclusive em caso de falha).
+
+#### Opção B — SQL **público com firewall** (mais simples — recomendado p/ alunos)
+
+1. No SQL server → **Networking → Public access** → **Selected networks** (ou **All networks** no laboratório).
+2. **Firewall rules:** marque **"Allow Azure services and resources to access this server"** (permite a Function alcançar) e adicione seu IP atual se quiser conectar pelo SSMS/Azure Data Studio.
+3. `Public network access = Enabled`.
+
+> Mesmo na Opção B, o `migrate-phase-01.yml` continua funcionando: ele abre/fecha o acesso de forma idempotente — se já estiver público, apenas garante a regra do runner e remove no final.
+
+### 2.4 Popular o banco (schema + dados)
+
+O banco precisa do **schema** e de **dados de referência** (seleções, estádios, jogos, categorias). Há duas formas:
+
+- **Opção 1 — Bacpac (recomendado, traz schema + dados reais):** o arquivo `FIFA2026Tickets.bacpac` **foi removido do repositório** e é **distribuído via Azure Blob** (link/SAS fornecido pelo instrutor). Importe pelo Portal:
+  - SQL server → **`Import database`** → aponte para o Storage/container onde está o `.bacpac` → **Database name:** `FIFA2026Tickets` → informe admin/senha → **`OK`**.
+- **Opção 2 — Schema + seed do repositório (banco "magro"):** aplique os scripts do fork:
+  - `fifa2026-api/database/schema.sql` (tabelas + FKs + índices)
+  - `fifa2026-api/database/seed-admin.sql` (usuário admin)
+  - Demais seeds de dados estão em `fifa2026-api/database/migrations/` (ex.: `2026-05-08-group-stage-72.sql`, `2026-05-08-real-fifa-prices.sql`, etc.).
+  - Aplique via **Azure Data Studio / SSMS** conectado ao banco, ou via `sqlcmd`:
+    ```bash
+    sqlcmd -S <seu-sql-server>.database.windows.net -U adminsql -P <senha> -d FIFA2026Tickets -i schema.sql
+    sqlcmd -S <seu-sql-server>.database.windows.net -U adminsql -P <senha> -d FIFA2026Tickets -i seed-admin.sql
+    ```
+
+> As **3 colunas que a F1 precisa** (`source`, `correlation_id`, `entra_oid`) **NÃO** entram aqui — elas são aplicadas depois, na **Fase 8 (migrations via Actions)**.
+
+✅ **Checkpoint:** banco `FIFA2026Tickets` criado e populado; você consegue conectar e ver as tabelas (`matches`, `ticket_categories`, `purchases`, etc.).
 
 ---
 
-## Fase 3 — Function App (no plano B1 existente, dentro da rede)
+## Fase 3 — App Service plan (B1, Windows)
 
-> Aqui está o aproveitamento: a Function entra no **plano B1 do Raphael**, que **já está na VNet** → alcança o banco privado sem sub-rede nova.
+A Function vai rodar num plano dedicado (não Consumption), igual à arquitetura do projeto.
 
-### 3.1 Criar a Function App
-1. Portal → **"Function App"** → **`+ Create`** → escolha o plano de hospedagem **"App Service plan"** (não Consumption).
+1. Portal → **"App Service plans"** → **`+ Create`**.
+2. **RG:** `<seu-rg>` · **Name:** `<seu-plano>` · **Region:** `<sua-regiao>`.
+3. **Operating System:** **Windows** · **Pricing plan:** **B1** (Basic).
+4. **`Review + create`** → **`Create`**.
+
+✅ **Checkpoint:** plano B1 Windows criado no seu RG.
+
+---
+
+## Fase 4 — Service Bus (a fila)
+
+### 4.1 Criar o Namespace
+
+1. Portal → **"Service Bus"** → **`+ Create`**.
+2. **Subscription:** `<sua-subscription>` · **Resource group:** `<seu-rg>`.
+3. **Namespace name:** `<seu-sb>` · **Location:** `<sua-regiao>`.
+4. **Pricing tier:** **Standard** ⚠️ (não Basic — Basic não suporta tópicos nem alguns recursos usados).
+5. **`Review + create`** → **`Create`** → **`Go to resource`**.
+
+### 4.2 Criar a fila
+
+1. No namespace → **Entities → Queues** → **`+ Queue`**.
+2. **Name:** `tickets-purchase` (FIXO).
+3. **Max delivery count:** `10` · **Lock duration:** `30` segundos.
+4. **`Create`**. *(A DLQ — dead-letter queue — é criada automaticamente.)*
+
+✅ **Checkpoint:** fila `tickets-purchase` listada. *(A connection string a gente pega na Fase 9.)*
+
+---
+
+## Fase 5 — Storage Account
+
+A Function precisa de um Storage para estado interno (triggers, locks, logs do host).
+
+1. Portal → **"Storage accounts"** → **`+ Create`**.
+2. **RG:** `<seu-rg>` · **Name:** `<seu-storage>` (minúsculo, sem hífen, ≤24 chars) · **Region:** `<sua-regiao>`.
+3. **Performance:** Standard · **Redundancy:** **LRS** (mais barato, suficiente).
+4. **`Review + create`** → **`Create`**.
+
+✅ **Checkpoint:** Storage criado no seu RG.
+
+---
+
+## Fase 6 — Log Analytics + Application Insights
+
+### 6.1 Log Analytics Workspace
+
+1. Portal → **"Log Analytics workspaces"** → **`+ Create`**.
+2. **RG:** `<seu-rg>` · **Name:** `<seu-log>` · **Region:** `<sua-regiao>` → **`Review + create`** → **`Create`**.
+
+### 6.2 Application Insights
+
+1. Portal → **"Application Insights"** → **`+ Create`**.
+2. **RG:** `<seu-rg>` · **Name:** `<seu-appi>` · **Region:** `<sua-regiao>`.
+3. **Workspace:** selecione `<seu-log>` (criado acima) → **`Review + create`** → **`Create`**.
+
+✅ **Checkpoint:** Log Analytics + App Insights criados. *(Como vamos usar isso está detalhado na Fase 12.)*
+
+---
+
+## Fase 7 — Function App (.NET 8 isolated, Windows, no plano B1)
+
+### 7.1 Criar a Function App
+
+1. Portal → **"Function App"** → **`+ Create`** → escolha o tipo de hospedagem **"App Service plan"** (não Consumption, não Flex).
 2. **Basics:**
-   - **RG:** `rg-hml-tik-cin-001`
-   - **Function App name:** `func-dev-tk-cin-001`
-   - **Do you want to deploy code or container?** Code
+   - **RG:** `<seu-rg>`
+   - **Function App name:** `<seu-func>`
+   - **Do you want to deploy code or container?** **Code**
    - **Runtime stack:** **.NET** · **Version:** **8 (isolated)**
-   - **Region:** **Central India**
+   - **Region:** `<sua-regiao>`
    - **Operating System:** **Windows** (mesmo do plano B1)
 3. **Hosting / Plan:**
-   - **App Service plan:** selecione o existente **`asp-prd-tk-cin-001`** (não crie um novo)
-4. **Storage:** selecione `stdevtkcin001`.
-5. **Monitoring:** Application Insights = **Yes** → `appi-dev-tk-cin-001`.
+   - **App Service plan:** selecione o seu **`<seu-plano>`** (não crie outro).
+4. **Storage:** selecione `<seu-storage>`.
+5. **Monitoring:** Application Insights = **Yes** → `<seu-appi>`.
 6. **`Review + create`** → **`Create`**.
 
-### 3.2 Ligar a Function na rede privada (VNet integration)
-1. Abra a `func-dev-tk-cin-001` → menu **Networking**.
+### 7.2 (Somente Opção A — SQL privado) Ligar a Function na VNet
+
+> Pule esta etapa se você escolheu o **SQL público (Opção B)**.
+
+1. Abra a `<seu-func>` → menu **Networking**.
 2. Em **Outbound traffic / VNet integration** → **Add VNet integration**.
-3. **VNet:** `vnet-prd-inf-cin-001` · **Subnet:** `snet-prd-inf-appsvc-cin-001` (a mesma dos apps) → **`Connect`**.
-4. Confirme que `WEBSITE_VNET_ROUTE_ALL` fica habilitado (rota todo o tráfego pela VNet → alcança o SQL privado).
+3. **VNet:** sua VNet · **Subnet:** a subnet do App Service (`snet-appsvc`) → **`Connect`**.
+4. Confirme que `WEBSITE_VNET_ROUTE_ALL` fica habilitado (roteia o tráfego de saída pela VNet → alcança o SQL privado).
 
-### 3.3 Ligar o "Always On"
+### 7.3 Ligar o "Always On"
+
 1. Function → **Settings → Configuration → General settings**.
-2. **Always On:** **On** → **`Save`**. *(Necessário para o gatilho do Service Bus funcionar em plano dedicado.)*
+2. **Always On:** **On** → **`Save`**. *(Necessário para o gatilho do Service Bus funcionar em plano dedicado — sem isso, a Function "dorme" e não consome a fila.)*
 
-✅ **Checkpoint:** Function criada, integrada à VNet, Always On ligado.
+### 7.4 Habilitar o SCM Basic Auth (necessário para o deploy via Actions)
 
----
+1. Function → **Settings → Configuration → General settings**.
+2. **SCM Basic Auth Publishing Credentials:** **On** → **`Save`**.
 
-## Fase 4 — Parametrização (App Settings / endpoints) — via portal
+> Sem isso, o `deploy-phase-01.yml` falha com **401** ao publicar via publish profile.
 
-> Function → **Settings → Environment variables / Application settings** → adicionar cada uma → **`Save`**.
-
-| Nome do App Setting | Valor | De onde vem |
-|---|---|---|
-| `ServiceBusConnection` | connection string do namespace `sb-dev-tk-cin-001` **SEM `EntityPath`** | Service Bus → **Shared access policies** → `RootManageSharedAccessKey` → Primary Connection String |
-| `SqlConnectionString` | `Server=sql-dev-tk-cin-001.database.windows.net,1433;Database=FIFA2026Tickets;User Id=adminsql;Password=<senha>;Encrypt=true;TrustServerCertificate=true` | mesma do backend (já conhecida) |
-| `FUNCTIONS_WORKER_RUNTIME` | `dotnet-isolated` | fixo |
-| `FUNCTIONS_EXTENSION_VERSION` | `~4` | fixo |
-
-> ⚠️ **Armadilha do `EntityPath`:** copie a connection string **do namespace** (RootManageSharedAccessKey), não da fila. Se vier `;EntityPath=tickets-purchase` no final, **remova** essa parte.
->
-> ⚠️ **Segredo:** a senha do banco não deve ser commitada em lugar nenhum — entra só aqui, no App Setting (ou, idealmente, como referência ao Key Vault `kv-dev-tk-cin-001`).
-
-✅ **Checkpoint:** 4 App Settings salvos; a Function reinicia sozinha.
+✅ **Checkpoint:** Function criada no plano B1, Always On ligado, SCM basic-auth ligado (e VNet integration se for Opção A).
 
 ---
 
-## Fase 5 — Banco: aplicar as 3 colunas (migrations via GitHub Actions)
+## Fase 8 — Migrations do banco (via GitHub Actions)
 
-A Function consumer grava em `purchases` usando colunas que **podem ainda não existir** no banco:
-`source`, `correlation_id` (migration `phase-01.sql`) e `entra_oid` (migration `phase-03.sql` — **obrigatória mesmo na F1**, senão o INSERT falha e a mensagem cai na DLQ).
+A Function consumer grava em `purchases` usando colunas que **ainda não existem** no banco recém-criado:
+`source`, `correlation_id` (migration `phase-01.sql`) e `entra_oid` (migration `phase-03.sql` — **obrigatória mesmo na F1**, senão o `INSERT` falha e a mensagem cai na DLQ).
 
-As migrations estão em `fifa2026-api/database/migrations/phase-01.sql` e `phase-03.sql` (aditivas e **idempotentes** — rodar de novo não causa efeito colateral).
+Os scripts estão em `fifa2026-api/database/migrations/phase-01.sql` e `phase-03.sql` — **aditivos e idempotentes** (rodar de novo não causa efeito colateral).
 
-> **Decisão (2026-06-24):** as migrations rodam **via GitHub Actions** (`migrate-phase-01.yml`), não na mão. Como o SQL está com **Public Network Access = Disabled**, o workflow liga o acesso público + abre o firewall **só para o IP do runner**, roda as migrations e **reverte tudo** (remove a regra + desliga o público), mesmo em caso de falha. É um passo **pré-workshop** (roda uma vez por ambiente), separado do deploy de código.
+> **Por que via Actions e não na mão?** Se você escolheu **SQL privado (Opção A)**, um runner do GitHub (internet pública) não alcança o banco. O `migrate-phase-01.yml` resolve isso de forma reproduzível: liga o acesso público + abre o firewall **só para o IP do runner**, roda as migrations e **reverte tudo** (remove a regra + desliga o público), **mesmo em caso de falha**. É um passo **pré-workshop** (roda uma vez por ambiente), separado do deploy de código. No **SQL público (Opção B)** o mesmo workflow também funciona, apenas garantindo/removendo a regra do runner.
 
-### 5.1 Pré-requisito — Service Principal (App Registration) **pelo portal**
+### 8.1 Pré-requisito — Service Principal (App Registration) pelo Portal (no SEU tenant)
 
-O workflow precisa de uma credencial Azure para ligar/desligar o acesso ao SQL. Crie via portal (mesma pegada do resto do guia — sem CLI):
+O workflow precisa de uma credencial Azure para ligar/desligar o acesso ao SQL. Crie via Portal (sem CLI), **no seu próprio tenant**:
 
 **A) Registrar o app (Microsoft Entra ID)**
 1. Portal → **Microsoft Entra ID** → **App registrations** → **`+ New registration`**.
@@ -139,15 +282,15 @@ O workflow precisa de uma credencial Azure para ligar/desligar o acesso ao SQL. 
 
 **B) Criar o client secret**
 1. No app → **Certificates & secrets** → **`+ New client secret`** → descrição + expiração → **`Add`**.
-2. **Copie na hora o `Value`** do secret (ele some depois de sair da tela).
+2. **Copie na hora o `Value`** do secret (ele some depois que você sai da tela).
 
 **C) Dar permissão no Resource Group**
-1. Portal → RG **`rg-hml-tik-cin-001`** → **Access control (IAM)** → **`+ Add` → `Add role assignment`**.
+1. Portal → RG **`<seu-rg>`** → **Access control (IAM)** → **`+ Add` → `Add role assignment`**.
 2. **Role:** **Contributor** (ou, mais estreito, **SQL Server Contributor**) → **`Next`**.
 3. **Assign access to:** *User, group, or service principal* → **`+ Select members`** → busque `sp-fifa2026-migrate` → selecione → **`Review + assign`**.
 
 **D) Montar o JSON do `AZURE_CREDENTIALS`**
-Com os valores acima + o **Subscription ID** (Portal → **Subscriptions**), monte o JSON que vai no secret (passo 5.2):
+Com os valores acima + o **Subscription ID** (Portal → **Subscriptions**), monte o JSON que vai no secret:
 ```json
 {
   "clientId": "<Application (client) ID>",
@@ -159,51 +302,179 @@ Com os valores acima + o **Subscription ID** (Portal → **Subscriptions**), mon
 
 > Em produção real, prefira **OIDC / Federated Credential** em vez de client secret de longa duração.
 
-### 5.2 Configurar secrets + variables no fork
+### 8.2 Configurar Secrets + Variables no fork
 
-GitHub (fork) → **Settings → Secrets and variables → Actions**:
+No **seu fork** → **Settings → Secrets and variables → Actions**:
 
-| Tipo | Nome | Valor |
+| Tipo | Nome | O que é | Onde você pega o SEU valor |
+|---|---|---|---|
+| Secret | `AZURE_CREDENTIALS` | JSON do Service Principal | passo 8.1.D |
+| Secret | `SQL_CONNECTION_STRING` | connection string do banco | monte conforme o bloco abaixo |
+| Variable | `SQL_SERVER` | nome do SQL server (sem sufixo) | `<seu-sql-server>` |
+| Variable | `RESOURCE_GROUP` | RG do SQL | `<seu-rg>` |
+
+> ⚠️ A senha entra **só** no secret `SQL_CONNECTION_STRING` — **nunca** commitada no código.
+
+> **Montar a `SQL_CONNECTION_STRING` (Cloud Shell PowerShell):** abra o **Cloud Shell** no Portal em modo **PowerShell** e monte a string (substitua server/senha):
+> ```powershell
+> $server = "<seu-sql-server>"
+> $senha  = "<senha-do-adminsql>"
+> "Server=$server.database.windows.net,1433;Database=FIFA2026Tickets;User Id=adminsql;Password=$senha;Encrypt=true;TrustServerCertificate=true"
+> ```
+> Copie a saída e cole no secret `SQL_CONNECTION_STRING`.
+
+### 8.3 Rodar o workflow
+
+No seu fork → **Actions → "Migrate Phase 01 — DB schema" → `Run workflow`** (escolha a branch `main`).
+
+> 🖱️ **Disparo manual apenas:** este workflow **não roda sozinho** (só tem `workflow_dispatch`). Você precisa clicar em **Run workflow** explicitamente.
+
+O workflow faz: `az login` (SP) → liga público + abre firewall do runner → aplica `phase-01.sql` e `phase-03.sql` (via `azure/sql-action`, que entende os batches `GO`) → **reverte** o acesso. Confira no log das migrations as colunas `source`, `correlation_id`, `entra_oid` e os índices `UQ_purchases_correlation_id` / `IX_purchases_entra_oid`.
+
+✅ **Checkpoint:** workflow verde; as 3 colunas existem na tabela `purchases`.
+
+---
+
+## Fase 9 — App Settings da Function (parametrização via Portal)
+
+> Function → **Settings → Environment variables / Application settings** → adicionar cada uma → **`Save`**.
+
+| Nome do App Setting | Valor | De onde vem |
 |---|---|---|
-| Secret | `AZURE_CREDENTIALS` | o JSON do SP (passo 5.1) |
-| Secret | `SQL_CONNECTION_STRING` | `Server=sql-dev-tk-cin-001.database.windows.net,1433;Database=FIFA2026Tickets;User Id=adminsql;Password=<senha>;Encrypt=true;TrustServerCertificate=true` |
-| Variable | `PHASE01_SQL_SERVER` | `sql-dev-tk-cin-001` |
-| Variable | `PHASE01_RESOURCE_GROUP` | `rg-hml-tik-cin-001` |
+| `ServiceBusConnection` | connection string do namespace `<seu-sb>` **SEM `EntityPath`** | Service Bus → **Shared access policies** → `RootManageSharedAccessKey` → Primary Connection String |
+| `SqlConnectionString` | `Server=<seu-sql-server>.database.windows.net,1433;Database=FIFA2026Tickets;User Id=adminsql;Password=<senha>;Encrypt=true;TrustServerCertificate=true` | a mesma do banco que você criou |
+| `FUNCTIONS_WORKER_RUNTIME` | `dotnet-isolated` | fixo |
+| `FUNCTIONS_EXTENSION_VERSION` | `~4` | fixo |
 
-> ⚠️ A senha entra **só** no secret `SQL_CONNECTION_STRING` — nunca commitada.
+> ⚠️ **Armadilha do `EntityPath`:** copie a connection string **do namespace** (RootManageSharedAccessKey), **não** da fila. Se vier `;EntityPath=tickets-purchase` no final, **remova** essa parte — senão o trigger do Service Bus não liga corretamente.
+>
+> ⚠️ **Segredo:** a senha do banco entra só aqui, no App Setting (ou, idealmente, como referência a um Key Vault). Nunca commit.
 
-### 5.3 Rodar o workflow
-
-**Actions → "Migrate Phase 01 — DB schema" → Run workflow** (na branch `phase-01-servicebus-functions` ou `main`).
-
-O workflow: `az login` (SP) → liga público + firewall do runner → aplica `phase-01.sql` e `phase-03.sql` (via `azure/sql-action`, que entende os batches `GO`) → **reverte** o acesso. Confira no log das migrations as colunas `source`, `correlation_id`, `entra_oid` e os índices `UQ_purchases_correlation_id` / `IX_purchases_entra_oid`.
+✅ **Checkpoint:** 4 App Settings salvos; a Function reinicia sozinha.
 
 ---
 
-## Fase 6 — Deploy do código (GitHub Actions — único por fase)
+## Fase 10 — Deploy do código (GitHub Actions)
 
-> Esta é a **única** parte de código. Não publique pelo portal — use o workflow da fase.
+> Esta é a **única** parte de código. Não publique pelo Portal — use o workflow da fase.
 
-1. No **GitHub (fork)**, configure:
-   - **Variable** `PHASE01_FUNCTION_APP_NAME` = `func-dev-tk-cin-001`
-   - **Secret** `PHASE01_FUNCTION_PUBLISH_PROFILE` = baixe da Function (Overview → **Get publish profile**) e cole o conteúdo.
-2. Garanta que o **SCM basic auth** está habilitado na Function (Configuration → **General settings → SCM Basic Auth Publishing = On**) — senão a action dá 401.
-3. Dispare o workflow **`deploy-phase-01.yml`** (na branch `phase-01-servicebus-functions`, ou via *Run workflow*).
-4. O workflow publica o código e roda o smoke test.
+### 10.1 Configurar a publicação no fork
 
-✅ **Checkpoint final (teste ponta a ponta):**
-- `POST /api/v2/purchase` → `202` + `correlationId`
-- mensagem aparece na fila e é consumida
-- `purchases` recebe o registro com `source='v2'`
-- compra inválida (matchId inexistente) → vai para a DLQ após 10 tentativas
+No **seu fork** → **Settings → Secrets and variables → Actions**:
+
+| Tipo | Nome | O que é | Onde você pega o SEU valor |
+|---|---|---|---|
+| Variable | `FUNCTION_APP_NAME` | nome da Function App de destino | `<seu-func>` |
+| Secret | `FUNCTION_PUBLISH_PROFILE` | publish profile da Function | pelo Portal (**Overview → `Get publish profile`**) ou via Cloud Shell PowerShell (bloco abaixo) |
+
+> Garanta que o **SCM Basic Auth** está **On** na Function (Fase 7.4) — senão a action retorna **401**.
+
+> **Pegar o publish profile (Cloud Shell PowerShell):** abra o **Cloud Shell** no modo **PowerShell** e rode (substitua RG e Function App):
+> ```powershell
+> az functionapp deployment list-publishing-profiles `
+>   -g "<seu-rg>" -n "<seu-func>" --xml
+> ```
+> Copie **todo** o XML retornado e cole no secret `FUNCTION_PUBLISH_PROFILE`.
+
+### 10.2 Disparar o deploy
+
+No seu fork → **Actions → "Deploy Phase 01 — Service Bus + Functions" → `Run workflow`** (branch `main`).
+O workflow faz: restore → build → test → publish → deploy → **smoke test** (`POST /api/v2/purchase`, valida que a resposta tem `.correlationId`).
+
+> 🖱️ **Disparo manual apenas:** este workflow **não roda sozinho** (só tem `workflow_dispatch`). Nada é publicado até você clicar em **Run workflow**.
+
+✅ **Checkpoint:** workflow verde; o step **"Smoke test (AC-10)"** mostra `Smoke test OK — .correlationId presente`.
 
 ---
 
-## Resumo do que aproveitamos vs criamos
+## Fase 11 — Application Insights: o que é e como vamos usar
 
-| Aproveitado (já existia) | Criado nesta aula |
+### 11.1 O que é
+
+**Application Insights (App Insights)** é o serviço de **APM (Application Performance Monitoring) / telemetria** do Azure. Ele coleta automaticamente, da sua Function: **requisições, dependências (chamadas ao SQL e ao Service Bus), exceções, logs e métricas de performance**. Os dados ficam guardados no **Log Analytics Workspace** (`<seu-log>`) que você criou na Fase 6, e podem ser consultados com a linguagem **KQL** (Kusto Query Language).
+
+### 11.2 Por que ele entra na F1
+
+A F1 é **assíncrona**: você faz um `POST` e recebe `202 Accepted` — mas o trabalho de verdade (consumir a fila e gravar no banco) acontece **depois, em background**, dentro da Function. Sem telemetria, você fica **cego**: não sabe se a mensagem foi consumida, se o `INSERT` no banco falhou, ou se a compra inválida caiu na DLQ. O App Insights é a **janela** para enxergar esse fluxo invisível.
+
+### 11.3 Como vamos usar (Portal → seu App Insights `<seu-appi>`)
+
+- **Live Metrics** (menu **Investigate → Live Metrics**): painel em **tempo real**. Dispare um `POST /api/v2/purchase` e veja a Function "acordar", processar a mensagem e as dependências (SQL) acenderem ao vivo. Ótimo para o checkpoint do workshop.
+- **Transaction search** (menu **Investigate → Transaction search**): busca individual de execuções. Pesquise por uma execução e abra a **timeline** dela — você vê a chamada ao Service Bus, a dependência do SQL e quanto tempo cada etapa levou.
+- **Failures** (menu **Investigate → Failures**): agrupa as **exceções**. Quando uma compra inválida cai na DLQ, a exceção que causou isso aparece aqui.
+- **Logs / KQL** (menu **Monitoring → Logs**): consultas livres. Exemplos úteis para acompanhar a F1:
+  ```kusto
+  // Execuções da Function nos últimos 30 min
+  requests
+  | where timestamp > ago(30m)
+  | order by timestamp desc
+
+  // Rastrear uma compra pelo correlationId (o rastro ponta a ponta)
+  union traces, requests, dependencies, exceptions
+  | where customDimensions.correlationId == "<correlationId-da-resposta>"
+  | order by timestamp asc
+
+  // Falhas que provavelmente foram para a DLQ
+  exceptions
+  | where timestamp > ago(1h)
+  | order by timestamp desc
+  ```
+
+> 🔎 **correlationId:** cada compra recebe um `correlationId` (devolvido na resposta `202`). Esse mesmo id é propagado pela mensagem e gravado na coluna `correlation_id` do banco — é a sua "chave de rastreamento" para seguir uma compra do `POST` até o `INSERT` (ou até a DLQ) no App Insights.
+
+✅ **Checkpoint:** você consegue abrir o Live Metrics e ver atividade quando dispara um `POST`.
+
+---
+
+## Fase 12 — Checkpoint final (teste ponta a ponta)
+
+Dispare uma compra válida (ajuste a URL para a SUA Function):
+
+```bash
+curl -sS "https://<seu-func>.azurewebsites.net/api/v2/purchase" \
+  -H "Content-Type: application/json" \
+  -d '{"matchId":1,"category":"VIP","userId":1,"quantity":1}'
+```
+
+✅ **Tudo certo se:**
+1. A resposta é **`202`** com um **`correlationId`** no corpo.
+2. A mensagem **aparece e é consumida** na fila `tickets-purchase` (Service Bus → Queues → métricas; ou Live Metrics do App Insights).
+3. A tabela **`purchases`** recebe um registro novo com **`source='v2'`** e o `correlation_id` da resposta.
+4. Uma compra **inválida** (ex.: `matchId` inexistente) vai para a **DLQ** após as tentativas de entrega (max delivery count = 10), e a exceção aparece em **App Insights → Failures**.
+
+---
+
+## Resumo do que você criou nesta aula
+
+| Camada | Recursos criados (todos no SEU `<seu-rg>`) |
 |---|---|
-| Banco `FIFA2026Tickets` | Service Bus + fila |
-| VNet + subnet `appsvc` + DNS privado | Storage Account |
-| Plano B1 `asp-prd-tk-cin-001` | Log Analytics + App Insights |
-| (apps backend/frontend intocados) | Function App (no plano B1) |
+| Dados | SQL Server `<seu-sql-server>` + DB `FIFA2026Tickets` (schema + seed + 3 colunas da F1) |
+| Mensageria | Service Bus `<seu-sb>` (Standard) + fila `tickets-purchase` (+ DLQ) |
+| Compute | App Service plan `<seu-plano>` (B1) + Function App `<seu-func>` (.NET 8 isolated) |
+| Apoio | Storage `<seu-storage>` |
+| Observabilidade | Log Analytics `<seu-log>` + App Insights `<seu-appi>` |
+| Identidade | App Registration `sp-fifa2026-migrate` (no seu tenant) |
+| Automação | Fork configurado: Variables + Secrets + 2 workflows (migrate + deploy) |
+
+---
+
+## Apêndice — Exemplo concreto (ambiente de referência validado em 2026-06-24)
+
+Estes foram os **nomes reais** usados no ambiente de referência que **funcionou ponta a ponta** — use como **modelo de preenchimento** da tabela de convenção de nomes (não como valores a copiar: cada aluno cria os seus).
+
+| Recurso | Valor de referência |
+|---|---|
+| Subscription | `SUBS - HML` (id `d970133e-…`) |
+| Resource Group | `rg-hml-tik-cin-001` |
+| Região | **Central India** |
+| SQL Server | `sql-dev-tk-cin-001` |
+| Database | `FIFA2026Tickets` (FIXO) |
+| Service Bus namespace | `sb-dev-tk-cin-001` |
+| Fila | `tickets-purchase` (FIXO) |
+| Storage Account | `stdevtkcin001` |
+| Log Analytics | `log-dev-tk-cin-001` |
+| Application Insights | `appi-dev-tk-cin-001` |
+| Function App | `func-dev-tk-cin-001` |
+| App Service plan | `asp-prd-tk-cin-001` (B1, Windows) |
+
+> Note o padrão **CAF** (Cloud Adoption Framework): `<tipo>-<ambiente>-<projeto>-<região>-<instância>`. Você não precisa seguir exatamente esse padrão — só seja consistente e use um prefixo seu.
