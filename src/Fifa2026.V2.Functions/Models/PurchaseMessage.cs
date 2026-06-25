@@ -12,6 +12,15 @@ public sealed class PurchaseMessage
     [JsonPropertyName("correlationId")]
     public Guid CorrelationId { get; set; }
 
+    /// <summary>
+    /// Identificador do pedido (carrinho) que originou esta mensagem. Várias mensagens
+    /// (1 por linha do carrinho) compartilham o mesmo OrderId, cada uma com seu
+    /// CorrelationId distinto. Nullable: mensagens legadas (pré-multi-item) não o trazem,
+    /// e o consumer não depende dele — não quebra o contrato existente.
+    /// </summary>
+    [JsonPropertyName("orderId")]
+    public Guid? OrderId { get; set; }
+
     [JsonPropertyName("matchId")]
     public int MatchId { get; set; }
 

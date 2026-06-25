@@ -11,8 +11,8 @@ name: Deploy Phase 03 — Identity (Function update + Gateway JWT)
 #
 # Pré-requisitos (configurados pelo @devops / por aluno):
 #   Function:
-#     - secret  PHASE01_FUNCTION_PUBLISH_PROFILE : publish profile da Function App
-#     - var     PHASE01_FUNCTION_APP_NAME        : nome da Function App de destino
+#     - secret  FUNCTION_PUBLISH_PROFILE : publish profile da Function App
+#     - var     FUNCTION_APP_NAME        : nome da Function App de destino
 #   Gateway (Container App):
 #     - secret  AZURE_CREDENTIALS                : service principal (az login)
 #     - var     ACR_LOGIN_SERVER                 : ex. acrfifa2026xy.azurecr.io
@@ -76,9 +76,9 @@ jobs:
       - name: Deploy to Azure Functions
         uses: Azure/functions-action@v1
         with:
-          app-name: ${{ github.event.inputs.function_app_name || vars.PHASE01_FUNCTION_APP_NAME }}
+          app-name: ${{ github.event.inputs.function_app_name || vars.FUNCTION_APP_NAME }}
           package: ./publish
-          publish-profile: ${{ secrets.PHASE01_FUNCTION_PUBLISH_PROFILE }}
+          publish-profile: ${{ secrets.FUNCTION_PUBLISH_PROFILE }}
 
   # ---------------------------------------------------------------------------
   # Job 2 — Gateway YARP (AddJwtBearer ativado + RequireAuthorization + config JWT).

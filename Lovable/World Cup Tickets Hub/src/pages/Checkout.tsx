@@ -13,6 +13,7 @@ import {
   purchaseViaFunction,
   getPurchaseStatus,
   type PurchaseV2Category,
+  type PurchaseV2Item,
 } from '@/lib/apiFunctionV2';
 
 // Oitavas de Final — toggle do fluxo de compra assíncrona (Function v2).
@@ -91,40 +92,55 @@ const Checkout: React.FC = () => {
   }
 
   // ---------------------------------------------------------------------------
-  // Oitavas de Final — fluxo de compra ASSÍNCRONO via Function v2.
-  // Envia 1 item (best-effort: a Function v2 processa uma compra match+categoria
-  // por correlationId; o carrinho local pode ter vários itens). Exibe imediatamente
-  // o correlationId (UX a) e faz polling do status até completed/failed/timeout (UX b).
+  // Oitavas de Final — fluxo de compra ASSÍNCRONO via Function v2 (CARRINHO INTEIRO).
+  // Mapeia TODAS as linhas do carrinho → 1 POST atômico { userId, items[] }; a Function
+  // explode em N mensagens (1 por linha). Exibe o orderId como protocolo (UX a) e faz
+  // polling de TODOS os correlationIds em paralelo até todos completed/algum failed/timeout (UX b).
   // ---------------------------------------------------------------------------
   const handleSubmitV2 = async () => {
     setIsProcessing(true);
     setV2CorrelationId(null);
     setV2StatusMessage(null);
 
-    // Mapeamento do payload a partir do PRIMEIRO item do carrinho.
-    const item = items[0];
-    const category = mapSectorToV2Category(item.sector.id);
-    const matchId = Number(item.match.id);
     const userId = Number(user?.id);
-
-    if (!category || !Number.isFinite(matchId) || !Number.isFinite(userId)) {
+    if (!Number.isFinite(userId)) {
       toast({
         title: 'Não foi possível montar o pedido',
         description:
-          'Dados do ingresso incompletos (categoria, jogo ou usuário). Recarregue e tente novamente.',
+          'Dados do usuário incompletos. Recarregue e tente novamente.',
         variant: 'destructive',
       });
       setIsProcessing(false);
       return;
     }
 
-    // 1) POST → 202 { correlationId }
-    const accepted = await purchaseViaFunction({
-      matchId,
-      category,
-      userId,
-      quantity: item.quantity,
-    });
+    // Mapeia TODO o carrinho → items, validando categoria e matchId POR linha.
+    const v2Items: PurchaseV2Item[] = [];
+    for (const cartItem of items) {
+      const category = mapSectorToV2Category(cartItem.sector.id);
+      const matchId = Number(cartItem.match.id);
+      const quantity = Number(cartItem.quantity);
+
+      if (
+        !category ||
+        !Number.isFinite(matchId) ||
+        !Number.isFinite(quantity)
+      ) {
+        toast({
+          title: 'Não foi possível montar o pedido',
+          description:
+            'Dados do ingresso incompletos (categoria, jogo ou quantidade). Recarregue e tente novamente.',
+          variant: 'destructive',
+        });
+        setIsProcessing(false);
+        return;
+      }
+
+      v2Items.push({ matchId, category, quantity });
+    }
+
+    // 1) POST atômico do carrinho → 202 { orderId, correlationIds[] }
+    const accepted = await purchaseViaFunction({ userId, items: v2Items });
 
     if (accepted.error || !accepted.data) {
       toast({
@@ -136,32 +152,58 @@ const Checkout: React.FC = () => {
       return;
     }
 
-    const correlationId = accepted.data.correlationId;
-    setV2CorrelationId(correlationId);
+    const { orderId, correlationIds } = accepted.data;
+    if (!Array.isArray(correlationIds) || correlationIds.length === 0) {
+      toast({
+        title: 'Resposta inesperada',
+        description: 'A Function v2 não retornou os protocolos do pedido.',
+        variant: 'destructive',
+      });
+      setIsProcessing(false);
+      return;
+    }
+
+    // Protocolo principal = orderId (pedido inteiro).
+    setV2CorrelationId(orderId);
     setV2StatusMessage('Pedido recebido — em processamento.');
     toast({
       title: 'Pedido recebido',
-      description: `Em processamento. Protocolo: ${correlationId}`,
+      description: `Em processamento. Protocolo: ${orderId}`,
     });
 
-    // 2) Polling do status (~2s, até ~10 tentativas).
+    // 2) Polling: a cada tick consulta TODOS os correlationIds em paralelo.
+    //    Confirma quando TODOS = completed; falha se algum = failed; timeout esgota tentativas.
     for (let attempt = 0; attempt < POLL_MAX_ATTEMPTS; attempt++) {
       await new Promise((resolve) => setTimeout(resolve, POLL_INTERVAL_MS));
 
-      const statusResult = await getPurchaseStatus(correlationId);
-      if (statusResult.error || !statusResult.data) {
-        // Erro transitório de rede: continua tentando até esgotar as tentativas.
+      const results = await Promise.all(
+        correlationIds.map((id) => getPurchaseStatus(id))
+      );
+
+      // Erro transitório em qualquer consulta: continua tentando até esgotar.
+      if (results.some((r) => r.error || !r.data)) {
         setV2StatusMessage('Consultando status do pedido...');
         continue;
       }
 
-      const status = (statusResult.data.status ?? '').toLowerCase();
+      const statuses = results.map((r) => (r.data?.status ?? '').toLowerCase());
 
-      if (status === 'completed') {
+      if (statuses.some((s) => s === 'failed')) {
+        setV2StatusMessage(null);
+        toast({
+          title: 'Compra não concluída',
+          description: `O processamento de um ou mais ingressos falhou (protocolo ${orderId}).`,
+          variant: 'destructive',
+        });
+        setIsProcessing(false);
+        return;
+      }
+
+      if (statuses.every((s) => s === 'completed')) {
         const purchasedTickets = items.map((cartItem, index) => ({
-          // Confirmação montada a partir do CARRINHO LOCAL + correlationId.
+          // Confirmação montada a partir do CARRINHO LOCAL + orderId.
           // O 202 não traz tickets[]/total_amount; NÃO fabricamos ticket fake.
-          ticketId: `${correlationId}-${index + 1}`,
+          ticketId: `${orderId}-${index + 1}`,
           matchId: cartItem.match.id,
           homeTeam: cartItem.homeTeam.name,
           awayTeam: cartItem.awayTeam.name,
@@ -194,38 +236,27 @@ const Checkout: React.FC = () => {
         clearCart();
         toast({
           title: 'Compra confirmada!',
-          description: `Protocolo ${correlationId}.`,
+          description: `Protocolo ${orderId}.`,
         });
         navigate('/payment-confirmation', {
           state: {
             tickets: purchasedTickets,
             totalAmount: grandTotal,
-            correlationId,
+            correlationId: orderId,
           },
         });
         setIsProcessing(false);
         return;
       }
 
-      if (status === 'failed') {
-        setV2StatusMessage(null);
-        toast({
-          title: 'Compra não concluída',
-          description: `O processamento do pedido falhou (protocolo ${correlationId}).`,
-          variant: 'destructive',
-        });
-        setIsProcessing(false);
-        return;
-      }
-
-      // status ainda em andamento (queued/processing/...): segue o polling.
+      // Alguma linha ainda em andamento (queued/processing/...): segue o polling.
       setV2StatusMessage('Processando seu pedido...');
     }
 
     // Timeout: não confirmou dentro das tentativas.
     toast({
       title: 'Processamento em andamento',
-      description: `Ainda não foi possível confirmar (protocolo ${v2CorrelationId ?? correlationId}). Verifique "Meus Ingressos" em instantes.`,
+      description: `Ainda não foi possível confirmar (protocolo ${orderId}). Verifique "Meus Ingressos" em instantes.`,
       variant: 'destructive',
     });
     setV2StatusMessage(

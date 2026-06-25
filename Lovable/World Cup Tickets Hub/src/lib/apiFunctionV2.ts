@@ -6,8 +6,9 @@
 //   - src/lib/apiV2.ts  (gateway YARP + Bearer MSAL — NÃO usado aqui; aquele
 //                        fluxo exige F2/F3 inexistentes neste ambiente)
 //
-// Esta Function tem authLevel Anonymous (sem token). O contrato é assíncrono:
-//   POST /api/v2/purchase            → 202 { correlationId, status: "queued" }
+// Esta Function tem authLevel Anonymous (sem token). O contrato é assíncrono e
+// processa o CARRINHO INTEIRO (fan-out: 1 POST → N mensagens, 1 por linha):
+//   POST /api/v2/purchase            → 202 { orderId, status, correlationIds[], correlationId? }
 //   GET  /api/v2/purchase/{id}       → { status: "completed" | "failed" | ... }
 //
 // Base URL via VITE_FUNCTION_V2_URL (nunca hardcoded). A presença dessa var é o
@@ -19,16 +20,25 @@ const FUNCTION_V2_URL = import.meta.env.VITE_FUNCTION_V2_URL ?? '';
 /** Categorias aceitas pela Function v2 (enum estável, independente do label do banco — defeito M-1). */
 export type PurchaseV2Category = 'VIP' | 'Cat1' | 'Cat2';
 
-export interface PurchaseFunctionV2Request {
+/** Uma linha do carrinho enviada ao envelope v2. */
+export interface PurchaseV2Item {
   matchId: number;
   category: PurchaseV2Category;
-  userId: number;
   quantity: number;
 }
 
+/** Envelope do POST /api/v2/purchase — carrinho inteiro. */
+export interface PurchaseFunctionV2Request {
+  userId: number;
+  items: PurchaseV2Item[];
+}
+
 export interface PurchaseFunctionV2Accepted {
-  correlationId: string;
+  orderId: string;
   status: string; // esperado: "queued"
+  correlationIds: string[];
+  /** Presente apenas quando há exatamente 1 item (== correlationIds[0]). */
+  correlationId?: string;
 }
 
 export interface PurchaseStatusV2 {

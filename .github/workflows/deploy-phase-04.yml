@@ -13,8 +13,8 @@ name: Deploy Phase 04 — Orchestration (Function webhook + n8n Container App)
 #
 # Pré-requisitos (configurados pelo @devops / por aluno):
 #   Function:
-#     - secret  PHASE01_FUNCTION_PUBLISH_PROFILE : publish profile da Function App
-#     - var     PHASE01_FUNCTION_APP_NAME        : nome da Function App de destino
+#     - secret  FUNCTION_PUBLISH_PROFILE : publish profile da Function App
+#     - var     FUNCTION_APP_NAME        : nome da Function App de destino
 #     - secret  N8N_WEBHOOK_URL                  : URL do webhook do workflow n8n
 #         (ex.: https://<n8n-fqdn>/webhook/purchase). Secret e não var: a URL contém o
 #         FQDN do n8n do aluno e o path do webhook — mantida fora do log público.
@@ -88,9 +88,9 @@ jobs:
       - name: Deploy to Azure Functions
         uses: Azure/functions-action@v1
         with:
-          app-name: ${{ github.event.inputs.function_app_name || vars.PHASE01_FUNCTION_APP_NAME }}
+          app-name: ${{ github.event.inputs.function_app_name || vars.FUNCTION_APP_NAME }}
           package: ./publish
-          publish-profile: ${{ secrets.PHASE01_FUNCTION_PUBLISH_PROFILE }}
+          publish-profile: ${{ secrets.FUNCTION_PUBLISH_PROFILE }}
 
       - name: Azure login
         uses: azure/login@v2
@@ -99,7 +99,7 @@ jobs:
 
       - name: Set N8N_WEBHOOK_URL App Setting (AC-6 — nunca hardcoded)
         env:
-          FUNCTION_APP_NAME: ${{ github.event.inputs.function_app_name || vars.PHASE01_FUNCTION_APP_NAME }}
+          FUNCTION_APP_NAME: ${{ github.event.inputs.function_app_name || vars.FUNCTION_APP_NAME }}
           N8N_WEBHOOK_URL: ${{ secrets.N8N_WEBHOOK_URL }}
         run: |
           set -euo pipefail
